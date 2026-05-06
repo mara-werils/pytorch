@@ -7427,6 +7427,11 @@ def sort_stable(x, *, stable=None, dim=-1, descending=False):
     if not V.graph.sizevars.statically_known_lt(dim_size, torch.iinfo(idx_dtype).max):
         return sort_fallback(x, stable=stable, dim=dim, descending=descending)
 
+    if V.graph.current_node.meta.get("custom", {}).get(
+        "flex_attention_block_mask_sort", False
+    ):
+        return sort_fallback(x, stable=stable, dim=dim, descending=descending)
+
     indices = iota(
         dim_size, start=0, step=1, dtype=idx_dtype, device=device, requires_grad=False
     )
