@@ -1019,7 +1019,8 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def setup_context(ctx, inputs: tuple[Any, ...], output: Any) -> None:
-        ctx.param_group = inputs[0]
+        param_group, *_ = inputs
+        ctx.param_group = param_group
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
@@ -1028,4 +1029,5 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def jvp(ctx: Any, *grad_inputs: Any) -> Any:
+        # Drop the non-tensor param_group tangent; outputs are identity on inputs.
         return grad_inputs[1:]
