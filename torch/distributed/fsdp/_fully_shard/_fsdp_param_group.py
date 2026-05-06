@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import functools
 import logging
 from typing import Any, cast, Literal, NamedTuple, TYPE_CHECKING
 
@@ -34,6 +33,7 @@ from ._fsdp_collectives import (
     SymmMemReduceScatter,
 )
 from ._fsdp_common import (
+    _disable_functorch_if_active,
     _dynamo_disable,
     DataParallelMeshInfo,
     DDPMeshInfo,
@@ -51,18 +51,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("torch.distributed.fsdp.fully_shard")
-
-
-def _disable_functorch_if_active(fn):
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        if torch._C._are_functorch_transforms_active():
-            with torch._C._DisableFuncTorch():
-                return fn(*args, **kwargs)
-        return fn(*args, **kwargs)
-
-    return wrapped
-
 
 _ModuleToHandleDict = dict[nn.Module, RemovableHandle]  # for state dict
 
