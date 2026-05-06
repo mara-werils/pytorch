@@ -348,48 +348,53 @@ class FSDPParamGroup:
 
     # Runtime #
     def unshard(self, async_op: bool = False):
-        if self._all_gather_result is not None:  # already called, pending wait
-            return
-        if self.is_unsharded:
-            return  # no-op
-        if (
-            not self.unshard_in_backward
-            and self._training_state == TrainingState.PRE_BACKWARD
-        ):
-            return
-        if self._reshard_after_forward_event is not None:
-            # Resharded parameter data is allocated in the default stream and
-            # used in the all-gather streams
-            self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)
-            self._reshard_after_forward_event = None
+        with torch._C._DisableFuncTorch():
+            if self._all_gather_result is not None:  # already called, pending wait
+                return
+            if self.is_unsharded:
+                return  # no-op
+            if (
+                not self.unshard_in_backward
+                and self._training_state == TrainingState.PRE_BACKWARD
+            ):
+                return
+            if self._reshard_after_forward_event is not None:
+                # Resharded parameter data is allocated in the default stream and
+                # used in the all-gather streams
+                self._wait_all_gather_streams_on_event(
+                    self._reshard_after_forward_event
+                )
+                self._reshard_after_forward_event = None
 
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            world_size = self._all_gather_process_group.size()
-        else:
-            world_size = 1
-        if world_size == 1:
-            # can't skip due to early return in wait_for_unshard if
-            # no self._all_gather_result
-            self._all_gather_result = AllGatherResult(
-                all_gather_output=self._all_gather_output,
-                all_gather_event=self.device_handle.Event().record(),
-                all_gather_work=None,
-                param_all_gather_input_dtypes=[],
-                param_all_gather_input_numels=[],
-                all_gather_input_split_sizes=[],
-            )
+            if isinstance(self.mesh_info, FSDPMeshInfo):
+                world_size = self._all_gather_process_group.size()
+            else:
+                world_size = 1
+            if world_size == 1:
+                # can't skip due to early return in wait_for_unshard if
+                # no self._all_gather_result
+                self._all_gather_result = AllGatherResult(
+                    all_gather_output=self._all_gather_output,
+                    all_gather_event=self.device_handle.Event().record(),
+                    all_gather_work=None,
+                    param_all_gather_input_dtypes=[],
+                    param_all_gather_input_numels=[],
+                    all_gather_input_split_sizes=[],
+                )
 
-            return
+                return
 
-        with record_function(self._with_fqn("FSDP::all_gather")):
-            self._all_gather_result = foreach_all_gather(
-                self.fsdp_params,
-                self._all_gather_process_group,
-                async_op,
-                *self.comm_ctx.get_all_gather_streams(async_op, self._training_state),
-                self.device,
-                self._all_gather_comm,
-            )
+            with record_function(self._with_fqn("FSDP::all_gather")):
+                self._all_gather_result = foreach_all_gather(
+                    self.fsdp_params,
+                    self._all_gather_process_group,
+                    async_op,
+                    *self.comm_ctx.get_all_gather_streams(
+                        async_op, self._training_state
+                    ),
+                    self.device,
+                    self._all_gather_comm,
+                )
 
     def wait_for_unshard(self):
         """
@@ -400,70 +405,71 @@ class FSDPParamGroup:
         all-gather result immediately after the current copy-out since we can
         already overlap the current copy-out with the previous reduce-scatter.
         """
-        if not self._all_gather_result:
-            return  # no preceding unshard
-        async_op = self._all_gather_result.all_gather_work is not None
-        if self._training_state == TrainingState.FORWARD:  # implicit prefetch
-            if prev_all_gather_state := self.comm_ctx.all_gather_state:
-                self._wait_all_gather_streams_on_event(prev_all_gather_state.event)
-                self.comm_ctx.all_gather_state = None  # free the all-gather result
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            world_size = self._all_gather_process_group.size()
-        else:
-            world_size = 1
-        if world_size == 1:
-            # directly initialize unsharded parameters from sharded parameters
+        with torch._C._DisableFuncTorch():
+            if not self._all_gather_result:
+                return  # no preceding unshard
+            async_op = self._all_gather_result.all_gather_work is not None
+            if self._training_state == TrainingState.FORWARD:  # implicit prefetch
+                if prev_all_gather_state := self.comm_ctx.all_gather_state:
+                    self._wait_all_gather_streams_on_event(prev_all_gather_state.event)
+                    self.comm_ctx.all_gather_state = None  # free all-gather result
+            if isinstance(self.mesh_info, FSDPMeshInfo):
+                world_size = self._all_gather_process_group.size()
+            else:
+                world_size = 1
+            if world_size == 1:
+                # directly initialize unsharded parameters from sharded parameters
+
+                for fsdp_param in self.fsdp_params:
+                    # Use all_gather_inputs which already handles conversion to param_dtype
+                    # This is consistent with the world_size > 1 path
+                    all_gather_input = fsdp_param.all_gather_inputs[0]
+
+                    # Make sure the all_gather_outputs has proper storage size before using it
+                    # First ensure we have at least one tensor in all_gather_outputs
+                    fsdp_param.init_all_gather_outputs(
+                        [all_gather_input.numel()],
+                        [all_gather_input.dtype],
+                        world_size,
+                        self.device,
+                    )
+
+                    tensor = fsdp_param.all_gather_outputs[0]
+                    alloc_storage(tensor)
+
+                    # find alternative way to check if tensor.is_inference
+                    with torch.autograd._unsafe_preserve_version_counter(tensor):
+                        tensor.copy_(all_gather_input)
+
+            else:
+                with record_function(self._with_fqn("FSDP::all_gather_copy_out")):
+                    foreach_all_gather_copy_out(
+                        self._all_gather_result,
+                        self.fsdp_params,
+                        self._all_gather_process_group,
+                    )
 
             for fsdp_param in self.fsdp_params:
-                # Use all_gather_inputs which already handles conversion to param_dtype
-                # This is consistent with the world_size > 1 path
-                all_gather_input = fsdp_param.all_gather_inputs[0]
+                fsdp_param.init_unsharded_param()
 
-                # Make sure the all_gather_outputs has proper storage size before using it
-                # First ensure we have at least one tensor in all_gather_outputs
-                fsdp_param.init_all_gather_outputs(
-                    [all_gather_input.numel()],
-                    [all_gather_input.dtype],
-                    world_size,
-                    self.device,
+            self._to_unsharded()
+            all_gather_copy_out_event = self.device_handle.Event()
+            all_gather_copy_out_event.record()
+
+            if (
+                not async_op
+                and self._training_state == TrainingState.FORWARD
+                and world_size > 1
+            ):
+                # Defer free to allow for overlap of this copy-out with next
+                # all-gather collective
+                self.comm_ctx.all_gather_state = AllGatherState(
+                    self._all_gather_result, all_gather_copy_out_event
                 )
+            else:
+                self._wait_all_gather_streams_on_event(all_gather_copy_out_event)
 
-                tensor = fsdp_param.all_gather_outputs[0]
-                alloc_storage(tensor)
-
-                # find alternative way to check if tensor.is_inference
-                with torch.autograd._unsafe_preserve_version_counter(tensor):
-                    tensor.copy_(all_gather_input)
-
-        else:
-            with record_function(self._with_fqn("FSDP::all_gather_copy_out")):
-                foreach_all_gather_copy_out(
-                    self._all_gather_result,
-                    self.fsdp_params,
-                    self._all_gather_process_group,
-                )
-
-        for fsdp_param in self.fsdp_params:
-            fsdp_param.init_unsharded_param()
-
-        self._to_unsharded()
-        all_gather_copy_out_event = self.device_handle.Event()
-        all_gather_copy_out_event.record()
-
-        if (
-            not async_op
-            and self._training_state == TrainingState.FORWARD
-            and world_size > 1
-        ):
-            # Defer free to allow for overlap of this copy-out with next
-            # all-gather collective
-            self.comm_ctx.all_gather_state = AllGatherState(
-                self._all_gather_result, all_gather_copy_out_event
-            )
-        else:
-            self._wait_all_gather_streams_on_event(all_gather_copy_out_event)
-
-        self._all_gather_result = None  # free unless saved in `all_gather_state`
+            self._all_gather_result = None  # free unless saved in `all_gather_state`
 
     def _wait_all_gather_streams_on_event(self, event: torch.Event | None):
         # Calling `unshard` before lazy init means streams are not initialized
@@ -473,16 +479,17 @@ class FSDPParamGroup:
             self.comm_ctx.all_gather_stream.wait_event(event)
 
     def reshard(self):
-        if self._training_state == TrainingState.FORWARD:
-            if not self._reshard_after_forward:
-                return
-            if self._use_post_forward_mesh:
-                self._to_sharded_post_forward()
-                self._reshard_after_forward_event = self.device_handle.Event()
-                if self._reshard_after_forward_event is not None:
-                    self._reshard_after_forward_event.record()
-                return
-        self._to_sharded()
+        with torch._C._DisableFuncTorch():
+            if self._training_state == TrainingState.FORWARD:
+                if not self._reshard_after_forward:
+                    return
+                if self._use_post_forward_mesh:
+                    self._to_sharded_post_forward()
+                    self._reshard_after_forward_event = self.device_handle.Event()
+                    if self._reshard_after_forward_event is not None:
+                        self._reshard_after_forward_event.record()
+                    return
+            self._to_sharded()
 
     def _reset_iter_state(self) -> None:
         # See FSDPState._reset_iter_state for semantics. Waits on any
@@ -1009,12 +1016,19 @@ def _get_param_module_infos(
 class RegisterPostBackwardFunction(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
-    def forward(ctx, param_group: FSDPParamGroup, *inputs: torch.Tensor):
+    def forward(param_group: FSDPParamGroup, *inputs: torch.Tensor):
         # All tensors in `inputs` should require gradient
-        ctx.param_group = param_group
         return inputs
+
+    @staticmethod
+    def setup_context(ctx, inputs: tuple[Any, ...], output: Any) -> None:
+        ctx.param_group = inputs[0]
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
         ctx.param_group.post_backward()
         return (None,) + grads
+
+    @staticmethod
+    def jvp(ctx: Any, *grad_inputs: Any) -> Any:
+        return grad_inputs[1:]
