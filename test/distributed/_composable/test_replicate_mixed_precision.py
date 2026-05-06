@@ -136,8 +136,7 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
             check_sharded_parity(self, ref_model, model)
 
     @skip_if_lt_x_gpu(2)
-    @requires_nccl_version((2, 10), "Need NCCL 2.10+ for bf16 collectives")
-    def test_jvp(self):
+    def test_input_jvp(self):
         torch.manual_seed(42)
         model = MLP(16, torch.device("cpu"))
         ref_model = copy.deepcopy(model).to(device_type.type).to(torch.bfloat16)
@@ -154,18 +153,21 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         )
         replicate(model, mesh=mesh, mp_policy=mp_policy)
 
-        torch.manual_seed(42 + self.rank + 1)
-        inp = torch.randn(
-            (4, 16), device=device_type.type, dtype=torch.bfloat16
-        ).requires_grad_()
-        tangent = torch.randn_like(inp)
+        for iter_idx in range(5):
+            torch.manual_seed(42 + self.rank * 10 + iter_idx)
+            inp = torch.randn(
+                (4, 16), device=device_type.type, dtype=torch.bfloat16
+            ).requires_grad_()
+            tangent = torch.randn_like(inp)
 
-        fsdp_out, fsdp_tangent = torch.func.jvp(lambda x: model(x), (inp,), (tangent,))
-        ref_out, ref_tangent = torch.func.jvp(
-            lambda x: ref_model(x), (inp,), (tangent,)
-        )
-        self.assertEqual(fsdp_out, ref_out)
-        self.assertEqual(fsdp_tangent, ref_tangent)
+            fsdp_out, fsdp_tangent = torch.func.jvp(
+                lambda x: model(x), (inp,), (tangent,)
+            )
+            ref_out, ref_tangent = torch.func.jvp(
+                lambda x: ref_model(x), (inp,), (tangent,)
+            )
+            self.assertEqual(fsdp_out, ref_out)
+            self.assertEqual(fsdp_tangent, ref_tangent)
 
     @skipIfRocmVersionLessThan((7, 0))
     @skip_if_lt_x_gpu(2)
