@@ -1011,6 +1011,8 @@ def _get_param_module_infos(
 
 
 class RegisterPostBackwardFunction(torch.autograd.Function):
+    generate_vmap_rule = True
+
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(param_group: FSDPParamGroup, *inputs: torch.Tensor):

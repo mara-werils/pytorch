@@ -172,6 +172,19 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
         replicate_fn(model)
         optim = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+        z_batch = torch.randn((6, dim), device=device_type.type)
+        t_batch = torch.rand((6, 1), device=device_type.type)
+        r_batch = t_batch * torch.rand((6, 1), device=device_type.type)
+        fsdp_vmap_out = torch.vmap(model)(z_batch, t_batch, r_batch)
+        ref_vmap_out = torch.vmap(
+            lambda z_, t_, r_: ref_model_bf16(
+                z_.to(torch.bfloat16),
+                t_.to(torch.bfloat16),
+                r_.to(torch.bfloat16),
+            )
+        )(z_batch, t_batch, r_batch)
+        self.assertEqual(fsdp_vmap_out, ref_vmap_out)
+
         num_iters = 5
         for iter_idx in range(num_iters):
             optim.zero_grad(set_to_none=(iter_idx % 2 == 0))

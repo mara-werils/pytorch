@@ -491,6 +491,8 @@ def _get_module_fsdp_state(module: nn.Module) -> FSDPState | None:
 
 
 class RegisterPreBackwardFunction(torch.autograd.Function):
+    generate_vmap_rule = True
+
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(state: FSDPState, output: torch.Tensor):
