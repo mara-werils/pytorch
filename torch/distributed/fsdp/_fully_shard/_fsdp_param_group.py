@@ -33,6 +33,7 @@ from ._fsdp_collectives import (
     SymmMemReduceScatter,
 )
 from ._fsdp_common import (
+    _disable_functorch_if_active,
     _dynamo_disable,
     DataParallelMeshInfo,
     DDPMeshInfo,
@@ -347,6 +348,7 @@ class FSDPParamGroup:
         )
 
     # Runtime #
+    @_disable_functorch_if_active
     def unshard(self, async_op: bool = False):
         if self._all_gather_result is not None:  # already called, pending wait
             return
@@ -391,6 +393,7 @@ class FSDPParamGroup:
                 self._all_gather_comm,
             )
 
+    @_disable_functorch_if_active
     def wait_for_unshard(self):
         """
         1. In forward with implicit prefetching, to overlap the current copy-out
@@ -472,6 +475,7 @@ class FSDPParamGroup:
         if hasattr(self.comm_ctx, "all_gather_stream") and event is not None:
             self.comm_ctx.all_gather_stream.wait_event(event)
 
+    @_disable_functorch_if_active
     def reshard(self):
         if self._training_state == TrainingState.FORWARD:
             if not self._reshard_after_forward:
@@ -1007,14 +1011,26 @@ def _get_param_module_infos(
 
 
 class RegisterPostBackwardFunction(torch.autograd.Function):
+    generate_vmap_rule = True
+
     @staticmethod
     # pyrefly: ignore [bad-override]
-    def forward(ctx, param_group: FSDPParamGroup, *inputs: torch.Tensor):
+    def forward(param_group: FSDPParamGroup, *inputs: torch.Tensor):
         # All tensors in `inputs` should require gradient
-        ctx.param_group = param_group
         return inputs
+
+    @staticmethod
+    def setup_context(ctx, inputs: tuple[Any, ...], output: Any) -> None:
+        param_group, *_ = inputs
+        ctx.param_group = param_group
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
         ctx.param_group.post_backward()
         return (None,) + grads
+
+    @staticmethod
+    def jvp(ctx: Any, *grad_inputs: Any) -> Any:
+        # Drop the non-tensor param_group tangent. The output pre-backward hook
+        # queues final post-backward after all primal/tangent paths finish.
+        return grad_inputs[1:]
