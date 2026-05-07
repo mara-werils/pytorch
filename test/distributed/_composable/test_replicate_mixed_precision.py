@@ -137,9 +137,24 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_input_jvp(self):
+        class ThreeInputMLP(nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.in_proj = nn.Linear(dim + 2, dim)
+                self.out_proj = nn.Linear(dim, dim)
+
+            def forward(
+                self, z: torch.Tensor, t: torch.Tensor, r: torch.Tensor
+            ) -> torch.Tensor:
+                x = torch.cat((z, t, r), dim=-1)
+                return self.out_proj(torch.relu(self.in_proj(x)))
+
         torch.manual_seed(42)
-        model = MLP(16, torch.device("cpu"))
-        ref_model = copy.deepcopy(model).to(device_type.type).to(torch.bfloat16)
+        dim = 16
+        model = ThreeInputMLP(dim)
+        ref_model = copy.deepcopy(model).to(device_type.type)
+        ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-3)
+        ref_model_bf16 = copy.deepcopy(ref_model).to(torch.bfloat16)
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -151,23 +166,70 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
             mesh_shape=(self.world_size,),
             mesh_dim_names=("replicate",),
         )
-        replicate(model, mesh=mesh, mp_policy=mp_policy)
+        replicate_fn = functools.partial(replicate, mesh=mesh, mp_policy=mp_policy)
+        replicate_fn(model.in_proj)
+        replicate_fn(model.out_proj)
+        replicate_fn(model)
+        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-        for iter_idx in range(5):
+        num_iters = 5
+        for iter_idx in range(num_iters):
+            optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
+            ref_optim.zero_grad(set_to_none=(iter_idx % 2 == 0))
             torch.manual_seed(42 + self.rank * 10 + iter_idx)
-            inp = torch.randn(
-                (4, 16), device=device_type.type, dtype=torch.bfloat16
-            ).requires_grad_()
-            tangent = torch.randn_like(inp)
+            x = torch.randn((4, dim), device=device_type.type)
+            e = torch.randn((4, dim), device=device_type.type)
+            t = torch.rand((4, 1), device=device_type.type)
+            r = t * torch.rand((4, 1), device=device_type.type)
+            # Require input grads to exercise backward through the JVP primal.
+            z = ((1 - t) * x + t * e).detach().requires_grad_()
+            t = t.detach().requires_grad_()
+            r = r.detach().requires_grad_()
+            v = e - x
 
             fsdp_out, fsdp_tangent = torch.func.jvp(
-                lambda x: model(x), (inp,), (tangent,)
+                lambda z_, t_, r_: model(z_, t_, r_),
+                (z, t, r),
+                (v, torch.ones_like(t), torch.zeros_like(r)),
             )
             ref_out, ref_tangent = torch.func.jvp(
-                lambda x: ref_model(x), (inp,), (tangent,)
+                lambda z_, t_, r_: ref_model_bf16(
+                    z_.to(torch.bfloat16),
+                    t_.to(torch.bfloat16),
+                    r_.to(torch.bfloat16),
+                ),
+                (z, t, r),
+                (v, torch.ones_like(t), torch.zeros_like(r)),
             )
-            self.assertEqual(fsdp_out, ref_out)
-            self.assertEqual(fsdp_tangent, ref_tangent)
+            self.assertEqual(fsdp_out, ref_out, msg=f"iter {iter_idx}")
+            self.assertEqual(fsdp_tangent, ref_tangent, msg=f"iter {iter_idx}")
+
+            fsdp_target = v - (t - r) * fsdp_tangent
+            ref_target = v - (t - r) * ref_tangent
+            fsdp_loss = ((fsdp_out - fsdp_target.detach()) ** 2).mean()
+            ref_loss = ((ref_out - ref_target.detach()) ** 2).mean()
+            self.assertEqual(fsdp_loss, ref_loss, msg=f"iter {iter_idx}")
+
+            fsdp_loss.backward()
+            optim.step()
+
+            ref_loss.backward()
+            for param in ref_model_bf16.parameters():
+                param.grad.data = param.grad.to(torch.float32)
+                dist.all_reduce(param.grad)
+                param.grad.div_(self.world_size)
+            for param_fp32, param_bf16 in zip(
+                ref_model.parameters(), ref_model_bf16.parameters()
+            ):
+                param_fp32.grad = param_bf16.grad
+                param_bf16.grad = None
+            ref_optim.step()
+            for param_fp32, param_bf16 in zip(
+                ref_model.parameters(), ref_model_bf16.parameters()
+            ):
+                param_bf16.detach().copy_(param_fp32)
+
+            check_sharded_parity(self, ref_model, model)
 
     @skipIfRocmVersionLessThan((7, 0))
     @skip_if_lt_x_gpu(2)
