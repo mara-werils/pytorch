@@ -74,6 +74,7 @@ from ..source import (
     SyntheticLocalSource,
 )
 from ..utils import (
+    _is_tensorify_enabled,
     check_unspec_or_constant_args,
     guard_if_dyn,
     has_torch_function,
@@ -242,6 +243,7 @@ def tracing_state_functions() -> dict[Callable[[], Any], bool | None]:
 
 
 bin_ops = dict.fromkeys(["add", "sub", "mul", "div", "sqrt"])
+
 
 dispatch_key_set_functions = {
     torch._C._dispatch_keys,
@@ -2867,11 +2869,18 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
         all_ints_or_floats = all(
             isinstance(x, SymNodeVariable) or x.is_python_constant() for x in args
         )
+        # This check queries whether the tensorify pass (a later FX pass in
+        # aot_autograd) is enabled, which is an intentional abstraction
+        # violation: dynamo is peeking at a downstream pass's config to decide
+        # whether to graph-break here. When tensorify is enabled, these
+        # scalar-only ops will be handled by the tensorify pass, so dynamo can
+        # let them through instead of breaking the graph.
         if (
             getattr(self.value, "__module__", "") == "torch"
             and self.value.__name__ in bin_ops
             and any_symints_or_symfloats
             and all_ints_or_floats
+            and not _is_tensorify_enabled()
         ):
             msg = f"""\
 Calling {str(self.value)} on only torch.SymInt arguments is not yet supported.
