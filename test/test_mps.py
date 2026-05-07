@@ -8137,12 +8137,12 @@ class TestMPS(TestCaseMPS):
         # save the default generator's state (offset = 1) to restore it later
         g_state = torch.mps.get_rng_state()
 
-        # generate random numbers with offset `1`
+        # generate random numbers with offset `2`
         mps_x = torch.randn(5, device='mps')
         # in this case, the random results must differ from the last generated random results
         self.assertNotEqual(mps_x, mps_y)
-        # since we called randn twice after seeding, the offset should be 2
-        self.assertEqual(torch.mps._get_default_mps_generator().get_offset(), 2)
+        # The Metal randn kernel packs 4 samples per Philox round, so single `randn(5)` call advances the offset by 2
+        self.assertEqual(torch.mps._get_default_mps_generator().get_offset(), 4)
 
         # mps_x was produced by g_state, we use it as our reference mps_y.
         mps_y = mps_x
@@ -8850,13 +8850,39 @@ class TestLargeTensors(TestCaseMPS):
         torch.mps.empty_cache()
 
     @serialTest()
-    def test_rand_2b_raises(self):
-        int32_max = torch.iinfo(torch.int32).max
-        with self.assertRaises(RuntimeError):
-            # This used to crash with NDArray dimension length > INT_MAX
-            x = torch.randint(0, 10, (int32_max + 1,), dtype=torch.int8, device='mps')
-        x = torch.randint(0, 10, (int32_max,), dtype=torch.int8, device='mps')
-        self.assertEqual(x.numel(), int32_max)
+    def test_rand_4b(self):
+        # Used to crash with NDArray dimension length > INT_MAX on MPSGraph;
+        # the Metal-kernel path decomposes via `iter.with_32bit_indexing()`.
+        # We pick `numel > 2**32` on purpose: it forces TensorIterator to emit
+        # at least two sub-iters, *and* without the splitting the kernel's
+        # `uint32_t` numel argument would silently wrap (so the second half
+        # would be `empty_like` garbage). 4 GiB of int8 covers both checks.
+        if torch.mps.recommended_max_memory() < 8_000_000_000:
+            raise unittest.SkipTest("Needs at least 8Gb of RAM")
+        n = (1 << 32) + 1
+
+        torch.mps.manual_seed(42)
+        g = torch.mps._get_default_mps_generator()
+        before = g.get_offset()
+        x = torch.randint(0, 100, (n,), dtype=torch.int8, device='mps')
+        after = g.get_offset()
+        self.assertEqual(x.numel(), n)
+        # `random_int` packs `16 / sizeof(T)` outputs per thread (one Philox
+        # round per thread), so for an int8 output it advances the generator
+        # by `ceil(n / 16)` slots. If only the first sub-iter ran, this
+        # would be at most ceil(2**31 / 16).
+        self.assertGreaterEqual(after - before, (n + 15) // 16)
+
+        # Re-seeding and drawing 1024 elements walks the same philox prefix
+        # the first sub-iter used, so it must match `x[:1024]` byte-for-byte.
+        torch.mps.manual_seed(42)
+        head_ref = torch.randint(0, 100, (1024,), dtype=torch.int8, device='mps')
+        self.assertTrue(torch.equal(x[:1024], head_ref))
+
+        # The tail must look like a uniform draw, not `empty_like` garbage:
+        # if the later sub-iters never ran, the tail would be all zeros.
+        tail = x[-1024:]
+        self.assertGreater(tail.unique().numel(), 50)
         del x
 
 
@@ -10060,7 +10086,13 @@ class TestLinalgMPS(TestCaseMPS):
 
 class TestSDPA(TestCaseMPS):
     def _compare_tensors(self, y, ref, tol=0.01):
-        denom = torch.maximum(ref.abs(), torch.tensor([1e-6], device=ref.device, dtype=ref.dtype))
+        # Floor the denominator at 1e-3: below that, |ref| is at the level of
+        # bfloat16/float16 ULP noise of zero, and dividing a 1-ULP absolute
+        # diff by a near-zero reference produces a huge relative ratio that
+        # dominates the mean and makes the metric meaningless. 1e-6 (the prior
+        # floor) was tight enough that a single near-zero output cell could
+        # blow up `err` past `tol` even with sub-ULP absolute error.
+        denom = torch.maximum(ref.abs(), torch.tensor([1e-3], device=ref.device, dtype=ref.dtype))
         err = ((y - ref).abs() / denom).mean().item()
         self.assertLess(err, tol)
 
