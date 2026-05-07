@@ -432,14 +432,14 @@ class FSDPState(_State):
                     stacklevel=2,
                 )
             t.register_hook(self._pre_backward)
-        if tensors:
-            return output
         if torch._C._are_functorch_transforms_active():
-            # Under functorch, outputs report requires_grad=False inside the
-            # transform even when returned primals participate in outer autograd.
+            # Under functorch, some differentiable outputs report
+            # requires_grad=False inside the transform even when returned
+            # primals participate in outer autograd.
             return _apply_to_tensors(
                 lambda t: RegisterPreBackwardFunction.apply(self, t)
-                if torch.is_floating_point(t) or torch.is_complex(t)
+                if not t.requires_grad
+                and (torch.is_floating_point(t) or torch.is_complex(t))
                 else t,
                 output,
             )
@@ -510,8 +510,12 @@ class RegisterPreBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def jvp(ctx: Any, *grad_inputs: Any) -> Any:
-        # Drop the non-tensor FSDP state tangent; output is identity on input.
-        return grad_inputs[1]
+        # Drop the non-tensor FSDP state tangent; keep tangent backward on the
+        # FSDP pre-backward path.
+        tangent = grad_inputs[1]
+        if tangent is None:
+            return None
+        return RegisterPreBackwardFunction.apply(ctx.state, tangent)
 
 
 def _register_group_forward_hooks(

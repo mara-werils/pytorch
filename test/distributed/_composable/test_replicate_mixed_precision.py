@@ -149,12 +149,14 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
                 x = torch.cat((z, t, r), dim=-1)
                 return self.out_proj(torch.relu(self.in_proj(x)))
 
+        class MixedOutputMLP(ThreeInputMLP):
+            def forward(
+                self, z: torch.Tensor, t: torch.Tensor, r: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                return super().forward(z, t, r), self.out_proj.weight.sum()
+
         torch.manual_seed(42)
         dim = 16
-        model = ThreeInputMLP(dim)
-        ref_model = copy.deepcopy(model).to(device_type.type)
-        ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-3)
-        ref_model_bf16 = copy.deepcopy(ref_model).to(torch.bfloat16)
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
@@ -167,10 +169,35 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
             mesh_dim_names=("replicate",),
         )
         replicate_fn = functools.partial(replicate, mesh=mesh, mp_policy=mp_policy)
-        replicate_fn(model.in_proj)
-        replicate_fn(model.out_proj)
-        replicate_fn(model)
-        optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        def init_model(model_cls):
+            model = model_cls(dim)
+            ref_model = copy.deepcopy(model).to(device_type.type)
+            ref_optim = torch.optim.Adam(ref_model.parameters(), lr=1e-3)
+            ref_model_bf16 = copy.deepcopy(ref_model).to(torch.bfloat16)
+            replicate_fn(model.in_proj)
+            replicate_fn(model.out_proj)
+            replicate_fn(model)
+            optim = torch.optim.Adam(model.parameters(), lr=1e-3)
+            return model, optim, ref_model, ref_optim, ref_model_bf16
+
+        def reduce_ref_grads_and_step(ref_model, ref_model_bf16, ref_optim) -> None:
+            for param in ref_model_bf16.parameters():
+                param.grad.data = param.grad.to(torch.float32)
+                dist.all_reduce(param.grad)
+                param.grad.div_(self.world_size)
+            for param_fp32, param_bf16 in zip(
+                ref_model.parameters(), ref_model_bf16.parameters()
+            ):
+                param_fp32.grad = param_bf16.grad
+                param_bf16.grad = None
+            ref_optim.step()
+            for param_fp32, param_bf16 in zip(
+                ref_model.parameters(), ref_model_bf16.parameters()
+            ):
+                param_bf16.detach().copy_(param_fp32)
+
+        model, optim, ref_model, ref_optim, ref_model_bf16 = init_model(ThreeInputMLP)
 
         z_batch = torch.randn((6, dim), device=device_type.type)
         t_batch = torch.rand((6, 1), device=device_type.type)
@@ -184,6 +211,30 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
             )
         )(z_batch, t_batch, r_batch)
         self.assertEqual(fsdp_vmap_out, ref_vmap_out)
+
+        mixed_model, mixed_optim, mixed_ref_model, mixed_ref_optim, mixed_ref_bf16 = (
+            init_model(MixedOutputMLP)
+        )
+        mixed_optim.zero_grad(set_to_none=True)
+        mixed_ref_optim.zero_grad(set_to_none=True)
+        fsdp_mixed_out, fsdp_aux = torch.vmap(mixed_model)(z_batch, t_batch, r_batch)
+        ref_mixed_out, ref_aux = torch.vmap(
+            lambda z_, t_, r_: mixed_ref_bf16(
+                z_.to(torch.bfloat16),
+                t_.to(torch.bfloat16),
+                r_.to(torch.bfloat16),
+            )
+        )(z_batch, t_batch, r_batch)
+        self.assertEqual(fsdp_mixed_out, ref_mixed_out)
+        self.assertEqual(fsdp_aux, ref_aux)
+        fsdp_mixed_loss = fsdp_mixed_out.square().mean()
+        ref_mixed_loss = ref_mixed_out.square().mean()
+        self.assertEqual(fsdp_mixed_loss, ref_mixed_loss)
+        fsdp_mixed_loss.backward()
+        mixed_optim.step()
+        ref_mixed_loss.backward()
+        reduce_ref_grads_and_step(mixed_ref_model, mixed_ref_bf16, mixed_ref_optim)
+        check_sharded_parity(self, mixed_ref_model, mixed_model)
 
         num_iters = 5
         for iter_idx in range(num_iters):
@@ -221,26 +272,17 @@ class TestReplicateMixedPrecisionTraining(FSDPTestContinuous):
             ref_target = v - (t - r) * ref_tangent
             fsdp_loss = ((fsdp_out - fsdp_target.detach()) ** 2).mean()
             ref_loss = ((ref_out - ref_target.detach()) ** 2).mean()
+            # Include the tangent in the loss so backward enters FSDP through
+            # the JVP tangent output, not only through the primal output.
+            fsdp_loss = fsdp_loss + fsdp_tangent.square().mean()
+            ref_loss = ref_loss + ref_tangent.square().mean()
             self.assertEqual(fsdp_loss, ref_loss, msg=f"iter {iter_idx}")
 
             fsdp_loss.backward()
             optim.step()
 
             ref_loss.backward()
-            for param in ref_model_bf16.parameters():
-                param.grad.data = param.grad.to(torch.float32)
-                dist.all_reduce(param.grad)
-                param.grad.div_(self.world_size)
-            for param_fp32, param_bf16 in zip(
-                ref_model.parameters(), ref_model_bf16.parameters()
-            ):
-                param_fp32.grad = param_bf16.grad
-                param_bf16.grad = None
-            ref_optim.step()
-            for param_fp32, param_bf16 in zip(
-                ref_model.parameters(), ref_model_bf16.parameters()
-            ):
-                param_bf16.detach().copy_(param_fp32)
+            reduce_ref_grads_and_step(ref_model, ref_model_bf16, ref_optim)
 
             check_sharded_parity(self, ref_model, model)
 

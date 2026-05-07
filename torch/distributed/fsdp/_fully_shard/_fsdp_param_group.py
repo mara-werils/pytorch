@@ -1031,5 +1031,6 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def jvp(ctx: Any, *grad_inputs: Any) -> Any:
-        # Drop the non-tensor param_group tangent; outputs are identity on inputs.
+        # Drop the non-tensor param_group tangent. The output pre-backward hook
+        # queues final post-backward after all primal/tangent paths finish.
         return grad_inputs[1:]
