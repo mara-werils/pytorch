@@ -186,6 +186,15 @@ def has_triton() -> bool:
 
 
 @functools.cache
+def has_meta_triton() -> bool:
+    if has_triton_package():
+        import triton
+
+        return "+fb.beta" in triton.__version__
+    return False
+
+
+@functools.cache
 def triton_backend() -> Any:
     from triton.compiler.compiler import make_backend
     from triton.runtime.driver import driver

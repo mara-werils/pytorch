@@ -14,7 +14,7 @@ import torch
 from torch._inductor.template_heuristics.triton_addmm import AddMMConfigMixin
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import Mod
-from torch.utils._triton import has_triton_stable_tma_api
+from torch.utils._triton import has_meta_triton, has_triton_stable_tma_api
 
 from .. import config, config as inductor_config
 from ..kernel.bmm import bmm_template
@@ -2276,7 +2276,12 @@ class BlackwellTMATemplateConfigMixin(TMATemplateConfigMixin):
                 template_kwargs.get("WARP_SPECIALIZE", True)
                 and not constraints_violated
             )
-            flatten = template_kwargs.get("FLATTEN", True) and not constraints_violated
+            # Meta WS pass has only validated flatten=False; OSS Triton uses flatten=True
+            flatten = (
+                template_kwargs.get("FLATTEN", True)
+                and not constraints_violated
+                and not has_meta_triton()
+            )
             yield {
                 **template_kwargs,
                 "NUM_SMS": get_num_sms(),
